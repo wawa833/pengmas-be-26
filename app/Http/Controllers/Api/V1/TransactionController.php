@@ -1,0 +1,223 @@
+<?php
+
+namespace App\Http\Controllers\Api\V1;
+
+use App\Http\Controllers\Controller;
+use App\Models\Menu;
+use App\Models\Setting;
+use App\Models\Transaction;
+use App\Models\TransactionDetail;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class TransactionController extends Controller
+{
+    public function index(Request $request): JsonResponse
+    {
+        $user = $request->user();
+
+        $query = Transaction::with(['details.menu', 'user']);
+
+        // Kasir only sees their own transactions
+        if ($user && $user->role === 'kasir') {
+            $query->where('user_id', $user->id);
+        } elseif ($request->filled('user_id')) {
+            $query->where('user_id', $request->user_id);
+        }
+
+        // Search by transaction code
+        if ($request->filled('search')) {
+            $query->where('transaction_code', 'LIKE', '%' . $request->search . '%');
+        }
+
+        // Filter by date
+        if ($request->filled('start_date')) {
+            $query->whereDate('created_at', '>=', $request->start_date);
+        }
+        if ($request->filled('end_date')) {
+            $query->whereDate('created_at', '<=', $request->end_date);
+        }
+
+        // Filter by payment method
+        if ($request->filled('payment_method') && !in_array($request->payment_method, ['all', 'Semua Metode', ''])) {
+            $method = $request->payment_method;
+            if ($method === 'QRIS' || $method === 'Digital') {
+                $query->whereIn('payment_method', ['QRIS', 'Digital']);
+            } else {
+                $query->where('payment_method', $method);
+            }
+        }
+
+        // Calculate summary cards
+        $summaryQuery = clone $query;
+        $totalTransactions = $summaryQuery->count();
+
+        $todayQuery = (clone $query)->whereDate('created_at', now()->toDateString());
+        $todayIncome = (clone $todayQuery)->sum('total_amount');
+        $cashCount = (clone $query)->where('payment_method', 'Tunai')->count();
+        $qrisCount = (clone $query)->whereIn('payment_method', ['QRIS', 'Digital'])->count();
+
+        $transactions = $query->orderBy('created_at', 'desc')->paginate(20);
+
+        $transactions->getCollection()->transform(function ($transaction) {
+            return $this->formatTransaction($transaction);
+        });
+
+        return response()->json([
+            'summary' => [
+                'total_transactions' => $totalTransactions,
+                'today_income' => (int) $todayIncome,
+                'cash_count' => $cashCount,
+                'qris_count' => $qrisCount,
+            ],
+            'data' => $transactions->items(),
+            'current_page' => $transactions->currentPage(),
+            'last_page' => $transactions->lastPage(),
+            'total' => $transactions->total(),
+        ]);
+    }
+
+    public function store(Request $request): JsonResponse
+    {
+        $request->validate([
+            'payment_method' => 'required|string|in:Tunai,Digital,QRIS',
+            'items' => 'required|array|min:1',
+            'items.*.product_id' => 'required|integer|exists:menus,id,is_active,1',
+            'items.*.quantity' => 'required|integer|min:1',
+            'items.*.notes' => 'nullable|string|max:255',
+            'notes' => 'nullable|string|max:255',
+            'discount_amount' => 'nullable|integer|min:0',
+            'tax_percentage' => 'nullable|integer|min:0|max:100',
+        ]);
+
+        $transaction = DB::transaction(function () use ($request) {
+            $transactionCode = $this->generateTransactionCode();
+
+            $subtotal = 0;
+            $detailsPayload = [];
+
+            foreach ($request->items as $item) {
+                $menu = Menu::findOrFail($item['product_id']);
+                $lineSubtotal = $menu->price * $item['quantity'];
+                $subtotal += $lineSubtotal;
+
+                $detailsPayload[] = [
+                    'menu_id' => $menu->id,
+                    'quantity' => $item['quantity'],
+                    'subtotal' => $lineSubtotal,
+                    'notes' => $item['notes'] ?? null,
+                ];
+            }
+
+            $discountAmount = $request->input('discount_amount', 0);
+            if ($discountAmount > $subtotal) {
+                throw new \Illuminate\Validation\ValidationException(
+                    validator([], [], []),
+                    response()->json([
+                        'message' => 'Diskon tidak boleh melebihi subtotal.',
+                        'errors' => ['discount_amount' => ['Diskon tidak boleh melebihi subtotal.']],
+                    ], 422)
+                );
+            }
+            $taxPercentage = $request->input('tax_percentage', 10);
+            $tax = (int) round(($subtotal - $discountAmount) * $taxPercentage / 100);
+            $totalAmount = $subtotal - $discountAmount + $tax;
+
+            $transaction = Transaction::create([
+                'transaction_code' => $transactionCode,
+                'subtotal' => $subtotal,
+                'tax' => $tax,
+                'total_amount' => $totalAmount,
+                'payment_method' => $request->payment_method,
+                'notes' => $request->notes,
+                'user_id' => $request->user()->id,
+                'discount_amount' => $discountAmount,
+                'tax_percentage' => $taxPercentage,
+            ]);
+
+            foreach ($detailsPayload as $detail) {
+                $detail['transaction_id'] = $transaction->id;
+                TransactionDetail::create($detail);
+            }
+
+            return $transaction;
+        });
+
+        $transaction->load(['details.menu', 'user']);
+
+        return response()->json([
+            'message' => 'Transaksi berhasil dibuat.',
+            'data' => $this->formatTransaction($transaction),
+        ], 201);
+    }
+
+    public function show($id): JsonResponse
+    {
+        $transaction = Transaction::with(['details.menu', 'user'])->findOrFail($id);
+
+        return response()->json([
+            'data' => $this->formatTransaction($transaction),
+        ]);
+    }
+
+    private function generateTransactionCode(): string
+    {
+        $today = now()->format('Ymd');
+        $prefix = "TRX-{$today}-";
+
+        $lastTransaction = Transaction::where('transaction_code', 'LIKE', "{$prefix}%")
+            ->orderBy('transaction_code', 'desc')
+            ->lockForUpdate()
+            ->first();
+
+        if ($lastTransaction) {
+            $lastNumber = (int) substr($lastTransaction->transaction_code, -4);
+            $nextNumber = $lastNumber + 1;
+        } else {
+            $nextNumber = 1;
+        }
+
+        return $prefix . str_pad((string) $nextNumber, 4, '0', STR_PAD_LEFT);
+    }
+
+    private function formatTransaction(Transaction $transaction): array
+    {
+        $data = [
+            'id' => $transaction->id,
+            'transaction_code' => $transaction->transaction_code,
+            'payment_method' => $transaction->payment_method,
+            'subtotal' => $transaction->subtotal,
+            'discount_amount' => $transaction->discount_amount,
+            'tax_percentage' => $transaction->tax_percentage,
+            'tax' => $transaction->tax,
+            'total_amount' => $transaction->total_amount,
+            'notes' => $transaction->notes,
+            'user' => $transaction->user ? [
+                'id' => $transaction->user->id,
+                'name' => $transaction->user->name,
+            ] : null,
+            'items' => $transaction->details->map(function ($detail) {
+                return [
+                    'id' => $detail->id,
+                    'menu_id' => $detail->menu_id,
+                    'menu_name' => $detail->menu->name ?? null,
+                    'quantity' => $detail->quantity,
+                    'price' => $detail->menu->price ?? null,
+                    'subtotal' => $detail->subtotal,
+                    'notes' => $detail->notes,
+                ];
+            }),
+            'created_at' => $transaction->created_at,
+        ];
+
+        if ($transaction->payment_method === 'Digital') {
+            $qrisSetting = Setting::where('key', 'qris_image')->first();
+            $data['qris_image_url'] = $qrisSetting && $qrisSetting->value
+                ? asset('storage/' . $qrisSetting->value)
+                : null;
+        }
+
+        return $data;
+    }
+}
